@@ -12,19 +12,20 @@ body{display:flex;flex-direction:column;height:100dvh;background:#10161e;color:#
 #warn{font-size:14px;color:#ffd54a;padding:4px 12px}
 #spend{font-size:16px;background:#7a4a00;color:#fff;padding:6px 12px}
 #out{flex:1;overflow-y:auto;overscroll-behavior:contain;font-size:28px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;padding:12px}
+#src{font-size:16px;line-height:1.4;max-height:4.2em;overflow-y:auto;color:#9fb0c3;white-space:pre-wrap;overflow-wrap:anywhere;padding:2px 12px}
 #meter{height:8px;background:#2a3544}
 #meterFill{height:100%;width:0;background:#3ecf6e}
 #controls{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px}
 #controls label{display:flex;align-items:center;gap:6px;font-size:18px}
-button,select,#keyInput{font-size:18px;padding:10px;touch-action:manipulation;background:#1b2430;color:#f4f6f8;border:1px solid #3d4b5e;border-radius:8px}
+button,select,#keyInput,#gKeyInput{font-size:18px;padding:10px;touch-action:manipulation;background:#1b2430;color:#f4f6f8;border:1px solid #3d4b5e;border-radius:8px}
 #startStop{flex:1 1 100%;position:relative;overflow:hidden;font-size:22px;padding:14px;background:#2e7d32;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
 #startStop.run{background:#8a2d2d}
 #holdFill{position:absolute;left:0;top:0;bottom:0;width:0;background:rgba(255,255,255,.35)}
 #startStop.holding #holdFill{width:100%;transition:width 1s linear}
 #ssText{position:relative}
-#keyBox{display:flex;gap:6px;flex:1 1 100%;margin:0}
+#keyBox,#gKeyBox{display:flex;gap:6px;flex:1 1 100%;margin:0}
 .vh{position:absolute;width:1px;height:1px;padding:0;border:0;overflow:hidden;clip:rect(0 0 0 0);opacity:0;pointer-events:none}
-#keyInput{flex:1;min-width:0}
+#keyInput,#gKeyInput{flex:1;min-width:0}
 </style>
 </head>
 <body>
@@ -32,14 +33,17 @@ button,select,#keyInput{font-size:18px;padding:10px;touch-action:manipulation;ba
 <div id="warn" hidden></div>
 <div id="spend" hidden>推定費用が$7を超えました(月の上限は$10です)</div>
 <div id="out"></div>
+<div id="src" hidden></div>
 <div id="meter"><div id="meterFill"></div></div>
 <div id="controls">
   <button id="startStop"><span id="holdFill"></span><span id="ssText">開始</span></button>
   <label><input type="checkbox" id="mute"> 音声オフ(文字だけ)</label>
+  <label>エンジン <select id="engine"><option value="openai">OpenAI</option><option value="gemini">Gemini</option></select></label>
   <label>ガイドの言語 <select id="lang"></select></label>
   <label>マイク <select id="mic"></select></label>
   <button id="micRefresh">マイク一覧を更新</button>
   <form id="keyBox" method="dialog"><input class="vh" name="username" autocomplete="username" value="openai-translator" tabindex="-1"><input id="keyInput" type="password" name="apikey" autocomplete="current-password" spellcheck="false" placeholder="OpenAI APIキー"> <button id="keySave" type="submit">決定</button></form>
+  <form id="gKeyBox" method="dialog" hidden><input class="vh" name="username" autocomplete="username" value="gemini-translator" tabindex="-1"><input id="gKeyInput" type="password" name="apikey" autocomplete="current-password" spellcheck="false" placeholder="Gemini APIキー"> <button id="gKeySave" type="submit">決定</button></form>
   <button id="keyClear" hidden>キー欄を空にする</button>
 </div>
 <script>
@@ -50,6 +54,20 @@ const CALLS_URL='https://api.openai.com/v1/realtime/translations/calls';
 const SECRET_BODY=JSON.stringify({session:{model:'gpt-realtime-translate',audio:{output:{language:'ja'}}},expires_after:{anchor:'created_at',seconds:600}});
 const RAW={echoCancellation:false,noiseSuppression:false,autoGainControl:false};
 const PRICE=0.034,MAXCH=3000,WARN_USD=7,HOLD_MS=1000;
+const G_VER='v1beta'; // set by gate test G0 (use 'v1alpha' only if G0 shows v1beta fails)
+const G_TOKEN_URL='https://generativelanguage.googleapis.com/'+G_VER+'/auth_tokens';
+const G_WS_URL='wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.'+G_VER+'.GenerativeService.BidiGenerateContentConstrained?access_token=';
+const G_SETUP=JSON.stringify({setup:{model:'models/gemini-3.5-live-translate-preview', // owner-verified 2026-10-03
+  generationConfig:{responseModalities:['AUDIO'],translationConfig:{targetLanguageCode:'ja',echoTargetLanguage:false}},
+  inputAudioTranscription:{},outputAudioTranscription:{}}}); // transcription fields belong at setup level
+const G_PRICE=0.0368,G_LIFE=590000,G_DEAD=10000,G_LEAD=0.3,G_CAP=1.5,SRCMAX=300;
+const CAP_URL=URL.createObjectURL(new Blob([`registerProcessor('cap',class extends AudioWorkletProcessor{
+  constructor(){super();this.b=new Int16Array(1600);this.n=0}
+  process(i){const x=i[0]&&i[0][0];if(x)for(let k=0;k<x.length;k++){
+    this.b[this.n++]=Math.max(-1,Math.min(1,x[k]))*32767;
+    if(this.n===1600){this.port.postMessage(this.b.buffer,[this.b.buffer]);this.b=new Int16Array(1600);this.n=0}}
+    return true}})`],{type:'text/javascript'})); // posts 100 ms of 16 kHz PCM16
+const TD=new TextDecoder();
 const ROT=(v=>Number.isFinite(v)&&v>0?v:0)(+new URLSearchParams(location.search).get('rot')); // TEST ONLY: ?rot=90 (seconds)
 const clampMs=(x,lo)=>Number.isFinite(x)?Math.min(3510000,Math.max(lo,x)):3510000; // a timer must never overflow or fire at once
 const LABEL={idle:'停止',connecting:'接続中',live:'翻訳中',retrying:'再接続中'};
@@ -61,14 +79,16 @@ const LANGS=[ // [code, 日本語名, native]
   ['he','ヘブライ語','עברית'],['ko','韓国語','한국어'],['nb','ノルウェー語','Norsk'],['sv','スウェーデン語','Svenska'],
   ['pt','ポルトガル語','Português']
 ];
-const LANG_KEY='translator:lang'; // the only thing this page ever stores; the API key is never persisted
+const LANG_KEY='translator:lang',ENG_KEY='translator:engine'; // the only things this page ever stores; API keys are never persisted
 const ls={
   get:k=>{try{return localStorage.getItem(k)}catch(e){return null}},
   set:(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}}
 };
 try{localStorage.removeItem('tr.key')}catch(e){} // purge the key an older build stored
-let KEY=''; // memory only
-let state='idle',reason='',t0=0,t1=0,acc=0,runId=0,busy=null,fails=0,cur=null; // acc = ms of finished runs since page load
+let KEY='',GKEY=''; // memory only
+let ENG='openai',pctx=null,capN=null,src='',srcLang='';
+const ZMSG=gMsg(new ArrayBuffer(3200)); // 100 ms of silence: all a draining Gemini connection gets
+let state='idle',reason='',t0=0,t1=0,acc={openai:0,gemini:0},runId=0,busy=null,fails=0,cur=null; // acc = ms of finished runs per engine since page load
 const conns=new Set();
 let stream=null,actx=null,meterT=0,retryT=0,rotT=0,clockT=0,wl=null,text='';
 let holdT=0,hintT=0,suppress=false;
@@ -84,22 +104,22 @@ function hms(x){
   return (h?h+':'+String(m).padStart(2,'0'):m)+':'+String(s).padStart(2,'0');
 }
 function render(){
-  const L=LANGS.find(l=>l[0]===$('lang').value)||LANGS[0];
+  const L=LANGS.find(l=>l[0]===$('lang').value)||LANGS[0],g=ENG==='gemini';
   let s=LABEL[state]+(reason?'('+reason+')':'')+' ・ ガイド: '+L[1],cost=0;
   if(t0){
     const run=(state==='idle'?t1:Date.now())-t0,sec=Math.floor(run/1000);
-    cost=(state==='idle'?acc:acc+run)/60000*PRICE; // cumulative since page load
-    s+=' ・ '+hms(sec)+' ・ 累計約$'+cost.toFixed(2);
+    cost=(state==='idle'?acc[ENG]:acc[ENG]+run)/60000*(g?G_PRICE:PRICE); // cumulative per engine since page load
+    s+=' ・ '+hms(sec)+' ・ 累計約$'+cost.toFixed(2)+(g?'(有料時の上限・無料枠なら$0)':'');
   }
   $('status').textContent=s;
-  $('spend').hidden=cost<=WARN_USD;
+  $('spend').hidden=g||cost<=WARN_USD; // the $7 banner is about the OpenAI cap
 }
 function setState(s,why){
   state=s;reason=why||'';
   const run=s!=='idle';
   $('ssText').textContent=run?'長押しで停止':'開始';
   $('startStop').classList.toggle('run',run);
-  ['mic','micRefresh','keyInput','keySave','keyClear'].forEach(id=>$(id).disabled=run);
+  ['mic','micRefresh','keyInput','keySave','keyClear','engine','gKeyInput','gKeySave'].forEach(id=>$(id).disabled=run);
   log('state',s,reason);render();
 }
 function warn(m){$('warn').textContent=m;$('warn').hidden=!m}
@@ -129,7 +149,11 @@ async function openMic(){
   const t=s.getAudioTracks()[0],got=t.getSettings().deviceId;
   if(got&&got!==id){s.getTracks().forEach(x=>x.stop());throw err('別のマイクが開いた')}
   log('mic',t.label);
-  t.onended=micLost;stream=s;startMeter(s);
+  t.onended=micLost;stream=s;
+  try{
+    try{startMeter(s)}catch(e){throw ENG==='gemini'?err('音声の初期化に失敗'):e} // Android may reject the 16 kHz context
+    if(ENG==='gemini')await capStart(s);
+  }catch(e){if(ENG==='gemini'&&stream===s)stopMic();throw e} // Gemini: release a half-open mic so the retry reopens it
 }
 function micLive(){return !!stream&&stream.getAudioTracks()[0].readyState==='live'}
 function stopMic(){
@@ -139,7 +163,7 @@ function stopMic(){
   $('meterFill').style.width='0';
 }
 function startMeter(s){
-  actx=new AudioContext();actx.resume().catch(()=>{});
+  actx=ENG==='gemini'?new AudioContext({sampleRate:16000}):new AudioContext();actx.resume().catch(()=>{});
   const an=actx.createAnalyser();an.fftSize=1024;
   actx.createMediaStreamSource(s).connect(an);
   const b=new Float32Array(1024);let h=0;
@@ -162,9 +186,9 @@ function micLost(){
 
 async function lock(){
   try{
-    wl=await navigator.wakeLock.request('screen');
-    if(state==='idle'){wl.release().catch(()=>{});wl=null;return}
-    warn('');log('wakelock ok');
+    const s=await navigator.wakeLock.request('screen');
+    if(state==='idle'||(wl&&!wl.released)){s.release().catch(()=>{});return} // Stopped meanwhile, or another request already won
+    wl=s;warn('');log('wakelock ok');
   }catch(e){warn('画面を点けたままにできません('+e.name+')。画面が消えないよう注意してください')}
 }
 
@@ -175,6 +199,9 @@ function kill(c){
   try{c.dc&&c.dc.close()}catch(e){}
   try{c.pc&&c.pc.close()}catch(e){}
   if(c.audio)c.audio.srcObject=null;
+  clearInterval(c.wd);
+  try{c.ws&&c.ws.close()}catch(e){}
+  if(c.g)c.g.disconnect(); // silences audio already queued for this connection
 }
 async function connect(){
   const c={dead:false,up:0,exp:0,draining:false};
@@ -212,6 +239,7 @@ async function connect(){
 }
 function onEvent(c,m){
   let e;try{e=JSON.parse(m.data)}catch(x){return}
+  if(!e)return;
   if(e.type==='session.output_transcript.delta')return append(e.delta||'');
   if(e.type==='session.created'){
     log('session.created',e.session);
@@ -229,6 +257,87 @@ function onEvent(c,m){
     return c.draining?kill(c):lost(c,'セッション終了');
   }
 }
+// ---- Gemini engine ----
+async function capStart(s){ // 16 kHz capture on the meter's context
+  const ctx=actx;
+  await ctx.audioWorklet.addModule(CAP_URL);
+  if(ctx!==actx)throw err('マイクが外れた'); // the mic closed meanwhile
+  capN=new AudioWorkletNode(ctx,'cap');
+  capN.port.onmessage=e=>gSend(e.data);
+  ctx.createMediaStreamSource(s).connect(capN);
+}
+function gMsg(buf){
+  const u=new Uint8Array(buf);let b='';
+  for(let i=0;i<u.length;i++)b+=String.fromCharCode(u[i]);
+  return JSON.stringify({realtimeInput:{audio:{data:btoa(b),mimeType:'audio/pcm;rate=16000'}}});
+}
+function gSend(buf){
+  const m=gMsg(buf);
+  conns.forEach(c=>{if(c.ws&&c.up&&!c.dead&&c.ws.readyState===1)c.ws.send(c.draining?ZMSG:m)});
+}
+async function gConnect(){
+  const c={dead:false,up:0,exp:0,draining:false,at:0,last:0};
+  conns.add(c);
+  try{
+    const r=await fetch(G_TOKEN_URL,{method:'POST',signal:AbortSignal.timeout(15000),
+      headers:{'x-goog-api-key':GKEY,'Content-Type':'application/json'},body:'{"uses":1}'});
+    if(!r.ok)throw await httpErr(r);
+    const tok=(await r.json()).name; // 'auth_tokens/…': never log it
+    log('token ok');
+    if(c.dead)throw err(c.why||'中断');
+    if(!tok)throw err('トークンなし');
+    const ws=c.ws=new WebSocket(G_WS_URL+tok);
+    ws.binaryType='arraybuffer';
+    c.g=pctx.createGain();c.g.gain.value=$('mute').checked?0:1;c.g.connect(pctx.destination);
+    const opened=new Promise((ok,ng)=>{c.ok=ok;c.fail=ng;setTimeout(()=>ng(err('接続タイムアウト')),20000)});
+    opened.catch(()=>{});
+    ws.onopen=()=>ws.send(G_SETUP);
+    ws.onmessage=m=>gEvent(c,m);
+    ws.onclose=e=>{
+      if(c.dead)return;
+      const m='切断 '+e.code+(e.reason?' '+String(e.reason).slice(0,80):'');
+      log('ws close',e.code,e.reason);
+      if(!c.up&&(e.code===1007||e.code===1008))return c.fail(err(m,true)); // bad request or not allowed: stop
+      lost(c,m);
+    };
+    await opened;
+    c.up=c.last=Date.now();c.exp=c.up+G_LIFE; // plan() rotates 90 s before the ~10-min connection limit
+    c.wd=setInterval(()=>{if(Date.now()-c.last>G_DEAD)lost(c,'応答なし')},2000);
+    return c;
+  }catch(e){kill(c);throw c.why?err(c.why):e}
+}
+function gEvent(c,m){
+  if(c.dead)return;
+  c.last=Date.now();
+  let e;try{e=JSON.parse(typeof m.data==='string'?m.data:TD.decode(m.data))}catch(x){return}
+  if(!e)return;
+  if(e.setupComplete){log('setupComplete');return c.ok()}
+  if(e.goAway){
+    log('goAway',e.goAway.timeLeft,c===cur?'current':'old');
+    if(c===cur&&Date.now()-c.up>60000){clearTimeout(rotT);next()} // rotate now; never more than once a minute
+    return;
+  }
+  const s=e.serverContent;if(!s)return; // resumption updates and usage metadata: ignored
+  if(s.inputTranscription)showSrc(s.inputTranscription);
+  if(s.outputTranscription)append(s.outputTranscription.text||'');
+  ((s.modelTurn&&s.modelTurn.parts)||[]).forEach(p=>{if(p.inlineData&&p.inlineData.data)play(c,p.inlineData.data)});
+}
+function showSrc(t){
+  if(t.languageCode)srcLang=t.languageCode;
+  src=(src+(t.text||'')).slice(-SRCMAX);
+  const o=$('src');o.textContent=(srcLang?'['+srcLang+'] ':'')+src.trimStart();o.scrollTop=o.scrollHeight;
+}
+function play(c,d){ // base64 PCM16 LE 24 kHz mono, scheduled back to back
+  if(c.dead||!c.g)return;
+  const b=atob(d),n=b.length>>1,f=new Float32Array(n);
+  for(let i=0;i<n;i++){const v=b.charCodeAt(2*i)|b.charCodeAt(2*i+1)<<8;f[i]=(v>32767?v-65536:v)/32768}
+  const t=pctx.currentTime;
+  if(c.at<t)c.at=t+G_LEAD;else if(c.at-t>G_CAP)return; // a late burst is dropped; the text is not
+  const buf=pctx.createBuffer(1,n,24000);buf.copyToChannel(f,0);
+  const sn=pctx.createBufferSource();sn.buffer=buf;sn.connect(c.g);sn.start(c.at);c.at+=buf.duration;
+  if(pctx.state!=='running')pctx.resume().catch(()=>{});
+}
+
 function lost(c,why){
   if(c.dead)return;
   if(!c.up){c.fail&&c.fail(err(why));return}
@@ -263,7 +372,7 @@ async function next(){
   const my=busy=runId;
   try{
     if(!micLive())await openMic();
-    const c=await connect();
+    const c=await (ENG==='gemini'?gConnect():connect());
     if(my!==runId){kill(c);return}
     if(!micLive()){kill(c);throw err('マイクが外れた')}
     adopt(c);
@@ -278,9 +387,13 @@ async function next(){
 }
 
 function start(){
-  KEY=$('keyInput').value.trim();showKey(); // read the field each time (autofill / paste)
-  if(!KEY)return setState('idle','キーを入れてください');
+  const g=ENG==='gemini';
+  if(g)GKEY=$('gKeyInput').value.trim();else KEY=$('keyInput').value.trim(); // read the field each time (autofill / paste)
+  showKey();
+  if(!(g?GKEY:KEY))return setState('idle','キーを入れてください');
+  if(g?/^sk-/.test(GKEY):/^AIza/.test(KEY))return setState('idle','別のエンジンのキーです'); // never send one provider's key to the other
   if(!$('mic').value)return setState('idle','マイクを選んでください');
+  if(g){if(!pctx)pctx=new AudioContext();pctx.resume().catch(()=>{})} // created inside the tap
   runId++;fails=0;t0=Date.now();
   setState('connecting','');lock();
   clearInterval(clockT);clockT=setInterval(render,1000);
@@ -292,11 +405,16 @@ function stop(why){
   clearTimeout(retryT);clearTimeout(rotT);clearInterval(clockT);
   [...conns].forEach(c=>kill(c));
   cur=null;stopMic();
+  if(pctx)pctx.suspend().catch(()=>{});
   if(wl){wl.release().catch(()=>{});wl=null}
-  warn('');t1=Date.now();if(was)acc+=t1-t0;setState('idle',why||'');
+  warn('');t1=Date.now();if(was)acc[ENG]+=t1-t0;setState('idle',why||'');
 }
 
-function showKey(){$('keyBox').hidden=!!KEY;$('keyClear').hidden=!KEY}
+function showKey(){
+  const g=ENG==='gemini';
+  $('keyBox').hidden=g||!!KEY;$('gKeyBox').hidden=!g||!!GKEY;
+  $('keyClear').hidden=!(g?GKEY:KEY);$('src').hidden=!g;
+}
 function holdEnd(){clearTimeout(holdT);holdT=0;$('startStop').classList.remove('holding')}
 function hint(){
   $('ssText').textContent='1秒間押し続けて停止';
@@ -305,8 +423,8 @@ function hint(){
 }
 const ss=$('startStop');
 ss.onpointerdown=e=>{
-  suppress=false;
   if(holdT||!e.isPrimary){holdCancel();return} // extra finger: cancel, never start a second timer
+  suppress=false;
   if(state==='idle')return;
   ss.classList.add('holding');
   holdT=setTimeout(()=>{
@@ -322,7 +440,10 @@ ss.onclick=()=>{
   if(suppress){suppress=false;return}
   if(state==='idle')start();
 };
-$('mute').onchange=()=>conns.forEach(c=>{if(c.audio)c.audio.muted=$('mute').checked});
+$('mute').onchange=()=>conns.forEach(c=>{
+  if(c.audio)c.audio.muted=$('mute').checked;
+  if(c.g)c.g.gain.value=$('mute').checked?0:1;
+});
 $('lang').onchange=()=>{ls.set(LANG_KEY,$('lang').value);render()};
 $('micRefresh').onclick=async()=>{
   try{const s=await navigator.mediaDevices.getUserMedia({audio:RAW});s.getTracks().forEach(t=>t.stop())}
@@ -330,13 +451,19 @@ $('micRefresh').onclick=async()=>{
   listMics();
 };
 $('keyBox').onsubmit=e=>{e.preventDefault();KEY=$('keyInput').value.trim();showKey()}; // no navigation; Chrome may offer to save it itself
-$('keyClear').onclick=()=>{KEY='';$('keyInput').value='';showKey()};
+$('gKeyBox').onsubmit=e=>{e.preventDefault();GKEY=$('gKeyInput').value.trim();showKey()};
+$('keyClear').onclick=()=>{
+  if(ENG==='gemini'){GKEY='';$('gKeyInput').value=''}else{KEY='';$('keyInput').value=''}
+  showKey();
+};
+$('engine').onchange=()=>{ENG=$('engine').value;ls.set(ENG_KEY,ENG);showKey();render()};
 document.addEventListener('visibilitychange',()=>{
   if(document.visibilityState==='visible'&&state!=='idle'&&(!wl||wl.released))lock();
 });
 LANGS.forEach(l=>$('lang').add(new Option(l[1]+' '+l[2],l[0])));
 $('lang').value=ls.get(LANG_KEY)||'pl';
 if(!$('lang').value)$('lang').value='pl';
+ENG=ls.get(ENG_KEY)==='gemini'?'gemini':'openai';$('engine').value=ENG;
 showKey();listMics();render();
 if(navigator.mediaDevices)navigator.mediaDevices.addEventListener('devicechange',listMics);
 </script>
