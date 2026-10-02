@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ライブ翻訳</title>
+<style>
+html,body{margin:0;height:100%;overscroll-behavior:none}
+body{display:flex;flex-direction:column;height:100dvh;background:#10161e;color:#f4f6f8;font-family:system-ui,sans-serif}
+[hidden]{display:none!important}
+#status{font-size:16px;background:#0a0e13;padding:8px 12px}
+#warn{font-size:14px;color:#ffd54a;padding:4px 12px}
+#spend{font-size:16px;background:#7a4a00;color:#fff;padding:6px 12px}
+#out{flex:1;overflow-y:auto;overscroll-behavior:contain;font-size:28px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;padding:12px}
+#meter{height:8px;background:#2a3544}
+#meterFill{height:100%;width:0;background:#3ecf6e}
+#controls{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px}
+#controls label{display:flex;align-items:center;gap:6px;font-size:18px}
+button,select,#keyInput{font-size:18px;padding:10px;touch-action:manipulation;background:#1b2430;color:#f4f6f8;border:1px solid #3d4b5e;border-radius:8px}
+#startStop{flex:1 1 100%;position:relative;overflow:hidden;font-size:22px;padding:14px;background:#2e7d32;touch-action:none;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
+#startStop.run{background:#8a2d2d}
+#holdFill{position:absolute;left:0;top:0;bottom:0;width:0;background:rgba(255,255,255,.35)}
+#startStop.holding #holdFill{width:100%;transition:width 1s linear}
+#ssText{position:relative}
+#keyBox{display:flex;gap:6px;flex:1 1 100%;margin:0}
+.vh{position:absolute;width:1px;height:1px;padding:0;border:0;overflow:hidden;clip:rect(0 0 0 0);opacity:0;pointer-events:none}
+#keyInput{flex:1;min-width:0}
+</style>
+</head>
+<body>
+<div id="status">停止</div>
+<div id="warn" hidden></div>
+<div id="spend" hidden>推定費用が$7を超えました(月の上限は$10です)</div>
+<div id="out"></div>
+<div id="meter"><div id="meterFill"></div></div>
+<div id="controls">
+  <button id="startStop"><span id="holdFill"></span><span id="ssText">開始</span></button>
+  <label><input type="checkbox" id="mute"> 音声オフ(文字だけ)</label>
+  <label>ガイドの言語 <select id="lang"></select></label>
+  <label>マイク <select id="mic"></select></label>
+  <button id="micRefresh">マイク一覧を更新</button>
+  <form id="keyBox" method="dialog"><input class="vh" name="username" autocomplete="username" value="openai-translator" tabindex="-1"><input id="keyInput" type="password" name="apikey" autocomplete="current-password" spellcheck="false" placeholder="OpenAI APIキー"> <button id="keySave" type="submit">決定</button></form>
+  <button id="keyClear" hidden>キー欄を空にする</button>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const log=(...a)=>console.log('[tr]',...a); // never pass the key, the secret or headers
+const SECRET_URL='https://api.openai.com/v1/realtime/translations/client_secrets';
+const CALLS_URL='https://api.openai.com/v1/realtime/translations/calls';
+const SECRET_BODY=JSON.stringify({session:{model:'gpt-realtime-translate',audio:{output:{language:'ja'}}},expires_after:{anchor:'created_at',seconds:600}});
+const RAW={echoCancellation:false,noiseSuppression:false,autoGainControl:false};
+const PRICE=0.034,MAXCH=3000,WARN_USD=7,HOLD_MS=1000;
+const ROT=(v=>Number.isFinite(v)&&v>0?v:0)(+new URLSearchParams(location.search).get('rot')); // TEST ONLY: ?rot=90 (seconds)
+const clampMs=(x,lo)=>Number.isFinite(x)?Math.min(3510000,Math.max(lo,x)):3510000; // a timer must never overflow or fire at once
+const LABEL={idle:'停止',connecting:'接続中',live:'翻訳中',retrying:'再接続中'};
+const LANGS=[ // [code, 日本語名, native]
+  ['pl','ポーランド語','Polski'],['en','英語','English'],['de','ドイツ語','Deutsch'],['fr','フランス語','Français'],
+  ['it','イタリア語','Italiano'],['es','スペイン語','Español'],['ru','ロシア語','Русский'],['cs','チェコ語','Čeština'],
+  ['sk','スロバキア語','Slovenčina'],['uk','ウクライナ語','Українська'],['hr','クロアチア語','Hrvatski'],
+  ['sr','セルビア語','Српски / Srpski'],['nl','オランダ語','Nederlands'],['hu','ハンガリー語','Magyar'],
+  ['he','ヘブライ語','עברית'],['ko','韓国語','한국어'],['nb','ノルウェー語','Norsk'],['sv','スウェーデン語','Svenska'],
+  ['pt','ポルトガル語','Português']
+];
+const LANG_KEY='translator:lang'; // the only thing this page ever stores; the API key is never persisted
+const ls={
+  get:k=>{try{return localStorage.getItem(k)}catch(e){return null}},
+  set:(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}}
+};
+try{localStorage.removeItem('tr.key')}catch(e){} // purge the key an older build stored
+let KEY=''; // memory only
+let state='idle',reason='',t0=0,t1=0,acc=0,runId=0,busy=null,fails=0,cur=null; // acc = ms of finished runs since page load
+const conns=new Set();
+let stream=null,actx=null,meterT=0,retryT=0,rotT=0,clockT=0,wl=null,text='';
+let holdT=0,hintT=0,suppress=false;
+
+function err(m,fatal){const e=new Error(m);e.fatal=!!fatal;return e}
+async function httpErr(r){
+  let m='';
+  try{m=await r.text();m=JSON.parse(m).error.message}catch(e){}
+  return err('HTTP '+r.status+' '+String(m).slice(0,100),[400,401,403,404].includes(r.status));
+}
+function hms(x){
+  const h=Math.floor(x/3600),m=Math.floor(x/60)%60,s=x%60;
+  return (h?h+':'+String(m).padStart(2,'0'):m)+':'+String(s).padStart(2,'0');
+}
+function render(){
+  const L=LANGS.find(l=>l[0]===$('lang').value)||LANGS[0];
+  let s=LABEL[state]+(reason?'('+reason+')':'')+' ・ ガイド: '+L[1],cost=0;
+  if(t0){
+    const run=(state==='idle'?t1:Date.now())-t0,sec=Math.floor(run/1000);
+    cost=(state==='idle'?acc:acc+run)/60000*PRICE; // cumulative since page load
+    s+=' ・ '+hms(sec)+' ・ 累計約$'+cost.toFixed(2);
+  }
+  $('status').textContent=s;
+  $('spend').hidden=cost<=WARN_USD;
+}
+function setState(s,why){
+  state=s;reason=why||'';
+  const run=s!=='idle';
+  $('ssText').textContent=run?'長押しで停止':'開始';
+  $('startStop').classList.toggle('run',run);
+  ['mic','micRefresh','keyInput','keySave','keyClear'].forEach(id=>$(id).disabled=run);
+  log('state',s,reason);render();
+}
+function warn(m){$('warn').textContent=m;$('warn').hidden=!m}
+function append(d){
+  text=(text+d).slice(-MAXCH);
+  const o=$('out');o.textContent=text;o.scrollTop=o.scrollHeight;
+}
+
+async function listMics(){
+  let ds=[];
+  try{ds=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==='audioinput')}catch(e){}
+  const sel=$('mic'),keep=sel.value;
+  sel.textContent='';
+  sel.add(new Option('— マイクを選ぶ —',''));
+  ds.forEach(d=>sel.add(new Option(d.label||'(名前なし:「マイク一覧を更新」を押す)',d.deviceId)));
+  if(keep&&ds.some(d=>d.deviceId===keep))sel.value=keep;
+  else{const u=ds.find(d=>/usb/i.test(d.label));sel.value=u?u.deviceId:''}
+}
+async function openMic(){
+  stopMic();
+  const id=$('mic').value,my=runId;
+  if(!id)throw err('マイクが見つからない');
+  let s;
+  try{s=await navigator.mediaDevices.getUserMedia({audio:{deviceId:{exact:id},...RAW}})}
+  catch(e){const na=e.name==='NotAllowedError';throw err(na?'マイクの許可がない':'マイクが見つからない',na)}
+  if(my!==runId){s.getTracks().forEach(x=>x.stop());throw err('中断')} // Stop pressed while the mic was opening
+  const t=s.getAudioTracks()[0],got=t.getSettings().deviceId;
+  if(got&&got!==id){s.getTracks().forEach(x=>x.stop());throw err('別のマイクが開いた')}
+  log('mic',t.label);
+  t.onended=micLost;stream=s;startMeter(s);
+}
+function micLive(){return !!stream&&stream.getAudioTracks()[0].readyState==='live'}
+function stopMic(){
+  if(stream){stream.getTracks().forEach(t=>{t.onended=null;t.stop()});stream=null}
+  clearInterval(meterT);
+  if(actx){actx.close().catch(()=>{});actx=null}
+  $('meterFill').style.width='0';
+}
+function startMeter(s){
+  actx=new AudioContext();actx.resume().catch(()=>{});
+  const an=actx.createAnalyser();an.fftSize=1024;
+  actx.createMediaStreamSource(s).connect(an);
+  const b=new Float32Array(1024);let h=0;
+  meterT=setInterval(()=>{
+    an.getFloatTimeDomainData(b);
+    let p=0;for(const v of b)p=Math.max(p,Math.abs(v));
+    h=Math.max(p,h*0.9);
+    const db=h>0?20*Math.log10(h):-99;
+    $('meterFill').style.width=Math.max(0,Math.min(100,(db+60)/60*100))+'%';
+  },100);
+}
+function micLost(){
+  if(state==='idle')return;
+  log('mic ended');
+  if(cur&&Date.now()-cur.up>60000)fails=0; // a healthy session resets the backoff
+  [...conns].forEach(c=>{c.why='マイクが外れた';kill(c)});
+  cur=null;clearTimeout(rotT);stopMic();
+  if(busy===runId)setState('retrying','マイクが外れた');else retry('マイクが外れた');
+}
+
+async function lock(){
+  try{
+    wl=await navigator.wakeLock.request('screen');
+    if(state==='idle'){wl.release().catch(()=>{});wl=null;return}
+    warn('');log('wakelock ok');
+  }catch(e){warn('画面を点けたままにできません('+e.name+')。画面が消えないよう注意してください')}
+}
+
+function kill(c){
+  if(c.dead)return;
+  c.dead=true;conns.delete(c);
+  if(!c.up&&c.fail)c.fail(err(c.why||'中断'));
+  try{c.dc&&c.dc.close()}catch(e){}
+  try{c.pc&&c.pc.close()}catch(e){}
+  if(c.audio)c.audio.srcObject=null;
+}
+async function connect(){
+  const c={dead:false,up:0,exp:0,draining:false};
+  conns.add(c);
+  try{
+    const r=await fetch(SECRET_URL,{method:'POST',signal:AbortSignal.timeout(15000),
+      headers:{'Authorization':'Bearer '+KEY,'Content-Type':'application/json'},body:SECRET_BODY});
+    if(!r.ok)throw await httpErr(r);
+    const j=await r.json();
+    log('secret ok',j.session); // the session object only, never the secret
+    if(c.dead)throw err(c.why||'中断');
+    const pc=c.pc=new RTCPeerConnection();
+    c.audio=new Audio();c.audio.autoplay=true;c.audio.muted=$('mute').checked;
+    pc.ontrack=e=>{c.audio.srcObject=e.streams[0]||new MediaStream([e.track]);c.audio.play().catch(()=>{})};
+    pc.addTrack(stream.getAudioTracks()[0],stream);
+    const dc=c.dc=pc.createDataChannel('oai-events');
+    dc.onmessage=m=>onEvent(c,m);
+    dc.onclose=()=>lost(c,'通信が切れた');
+    pc.onconnectionstatechange=()=>{
+      const s=pc.connectionState;
+      if(s==='failed')lost(c,'接続失敗');
+      if(s==='disconnected')setTimeout(()=>{if(pc.connectionState==='disconnected')lost(c,'接続断')},5000);
+    };
+    const opened=new Promise((ok,ng)=>{dc.onopen=ok;c.fail=ng;setTimeout(()=>ng(err('接続タイムアウト')),20000)});
+    opened.catch(()=>{});
+    const offer=await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    const a=await fetch(CALLS_URL,{method:'POST',signal:AbortSignal.timeout(15000),
+      headers:{'Authorization':'Bearer '+j.value,'Content-Type':'application/sdp'},body:offer.sdp});
+    if(!a.ok)throw await httpErr(a);
+    await pc.setRemoteDescription({type:'answer',sdp:await a.text()});
+    await opened;
+    c.up=Date.now();return c;
+  }catch(e){kill(c);throw c.why?err(c.why):e} // c.why is set by micLost
+}
+function onEvent(c,m){
+  let e;try{e=JSON.parse(m.data)}catch(x){return}
+  if(e.type==='session.output_transcript.delta')return append(e.delta||'');
+  if(e.type==='session.created'){
+    log('session.created',e.session);
+    let x=+(e.session&&e.session.expires_at);if(x>1e11)x/=1000; // tolerate ms
+    const ms=x*1000-Date.now();
+    if(ms>120000&&ms<=7200000){c.exp=x*1000;if(c===cur)plan(c)} // else ignore: default 50 min
+    return;
+  }
+  if(e.type==='error'){
+    log('error',e.error);
+    return lost(c,'エラー '+String((e.error&&e.error.message)||'').slice(0,80));
+  }
+  if(e.type==='session.closed'){
+    log('session.closed',c===cur?'current':'old');
+    return c.draining?kill(c):lost(c,'セッション終了');
+  }
+}
+function lost(c,why){
+  if(c.dead)return;
+  if(!c.up){c.fail&&c.fail(err(why));return}
+  if(c!==cur){kill(c);return}
+  log('lost',why);
+  if(Date.now()-c.up>60000)fails=0;
+  kill(c);cur=null;clearTimeout(rotT);
+  if(busy===runId)setState('retrying',why);else retry(why);
+}
+function retry(why){
+  setState('retrying',why);
+  clearTimeout(retryT);
+  retryT=setTimeout(next,clampMs(Math.min(30,2**fails++)*1000,1000));
+}
+function plan(c){
+  clearTimeout(rotT);
+  const at=ROT?c.up+ROT*1000:c.exp?c.exp-90000:c.up+3000000;
+  rotT=setTimeout(next,clampMs(at-Date.now(),60000)); // keep the 60 s floor (plan D9)
+}
+function adopt(c){
+  const old=cur;
+  cur=c;setState('live','');plan(c);
+  log('adopted',old?'rotation':'');
+  if(old){
+    old.draining=true;
+    try{old.dc.send(JSON.stringify({type:'session.close'}))}catch(e){}
+    setTimeout(()=>kill(old),15000);
+  }
+}
+async function next(){
+  if(state==='idle'||busy===runId)return;
+  const my=busy=runId;
+  try{
+    if(!micLive())await openMic();
+    const c=await connect();
+    if(my!==runId){kill(c);return}
+    if(!micLive()){kill(c);throw err('マイクが外れた')}
+    adopt(c);
+  }catch(e){
+    if(my!==runId)return;
+    const m=e.name==='TypeError'?'ネット接続なし':e.name==='TimeoutError'?'応答なし':e.message;
+    log('attempt failed',e.name,e.message);
+    if(cur)rotT=setTimeout(next,30000); // rotation failed; old session still running
+    else if(e.fatal)stop(m);
+    else retry(m);
+  }finally{if(busy===my)busy=null}
+}
+
+function start(){
+  KEY=$('keyInput').value.trim();showKey(); // read the field each time (autofill / paste)
+  if(!KEY)return setState('idle','キーを入れてください');
+  if(!$('mic').value)return setState('idle','マイクを選んでください');
+  runId++;fails=0;t0=Date.now();
+  setState('connecting','');lock();
+  clearInterval(clockT);clockT=setInterval(render,1000);
+  next();
+}
+function stop(why){
+  const was=state!=='idle';
+  runId++;
+  clearTimeout(retryT);clearTimeout(rotT);clearInterval(clockT);
+  [...conns].forEach(c=>kill(c));
+  cur=null;stopMic();
+  if(wl){wl.release().catch(()=>{});wl=null}
+  warn('');t1=Date.now();if(was)acc+=t1-t0;setState('idle',why||'');
+}
+
+function showKey(){$('keyBox').hidden=!!KEY;$('keyClear').hidden=!KEY}
+function holdEnd(){clearTimeout(holdT);holdT=0;$('startStop').classList.remove('holding')}
+function hint(){
+  $('ssText').textContent='1秒間押し続けて停止';
+  clearTimeout(hintT);
+  hintT=setTimeout(()=>{if(state!=='idle')$('ssText').textContent='長押しで停止'},1500);
+}
+const ss=$('startStop');
+ss.onpointerdown=e=>{
+  suppress=false;
+  if(holdT||!e.isPrimary){holdCancel();return} // extra finger: cancel, never start a second timer
+  if(state==='idle')return;
+  ss.classList.add('holding');
+  holdT=setTimeout(()=>{
+    holdEnd();
+    suppress=true; // the click that follows this release must not restart
+    if(state!=='idle')stop('');
+  },HOLD_MS);
+};
+const holdCancel=()=>{if(holdT){holdEnd();hint()}};
+ss.onpointerup=holdCancel;ss.onpointercancel=holdCancel;ss.onpointerleave=holdCancel;
+ss.oncontextmenu=e=>e.preventDefault();
+ss.onclick=()=>{
+  if(suppress){suppress=false;return}
+  if(state==='idle')start();
+};
+$('mute').onchange=()=>conns.forEach(c=>{if(c.audio)c.audio.muted=$('mute').checked});
+$('lang').onchange=()=>{ls.set(LANG_KEY,$('lang').value);render()};
+$('micRefresh').onclick=async()=>{
+  try{const s=await navigator.mediaDevices.getUserMedia({audio:RAW});s.getTracks().forEach(t=>t.stop())}
+  catch(e){setState('idle','マイクの許可: '+e.name)}
+  listMics();
+};
+$('keyBox').onsubmit=e=>{e.preventDefault();KEY=$('keyInput').value.trim();showKey()}; // no navigation; Chrome may offer to save it itself
+$('keyClear').onclick=()=>{KEY='';$('keyInput').value='';showKey()};
+document.addEventListener('visibilitychange',()=>{
+  if(document.visibilityState==='visible'&&state!=='idle'&&(!wl||wl.released))lock();
+});
+LANGS.forEach(l=>$('lang').add(new Option(l[1]+' '+l[2],l[0])));
+$('lang').value=ls.get(LANG_KEY)||'pl';
+if(!$('lang').value)$('lang').value='pl';
+showKey();listMics();render();
+if(navigator.mediaDevices)navigator.mediaDevices.addEventListener('devicechange',listMics);
+</script>
+</body>
+</html>
